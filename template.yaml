@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Webhook Shield - anti-chaos gateway for SaaS webhooks (SAM + LocalStack)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        IDEMPOTENCY_TABLE: !Ref WebhookIdempotencyTable
+        RATELIMIT_TABLE: !Ref WebhookRateLimitTable
+        QUEUE_URL: !Ref WebhookQueue
+        PROVIDER_SECRETS_JSON: '{"stripe":"dev_stripe_secret","github":"dev_github_secret"}'
+        AWS_ENDPOINT_URL: "http://host.docker.internal:4566"
+
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: WebhookShieldApi
+      StageName: dev
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+
+  WebhookIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WebhookIdempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WebhookRateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WebhookRateLimit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WebhookDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: WebhookDLQ
+      MessageRetentionPeriod: 1209600
+
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: WebhookQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookDLQ.Arn
+        maxReceiveCount: 1
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: ingest.app.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebhookIdempotencyTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebhookRateLimitTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WebhookQueue.QueueName
+      Events:
+        WebhookIn:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /webhooks/{provider}
+            Method: POST
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: worker.app.handler
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WebhookQueue.QueueName
+      Events:
+        QueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WebhookQueue.Arn
+            BatchSize: 10
+
+  ReplayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: replay.app.handler
+      Timeout: 30
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WebhookDLQ.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WebhookQueue.QueueName
+      Environment:
+        Variables:
+          DLQ_URL: !Ref WebhookDLQ
+          MAIN_QUEUE_URL: !Ref WebhookQueue
+      Events:
+        Replay:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /replay/{provider}
+            Method: POST
+
+Outputs:
+  ApiId:
+    Value: !Ref Api
+  ApiUrlLocalStackHint:
+    Value: !Sub "http://localhost:4566/restapis/${Api}/dev/_user_request_"
